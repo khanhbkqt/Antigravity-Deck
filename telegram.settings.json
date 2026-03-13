@@ -1,0 +1,10 @@
+{
+  "telegramBotToken": "8667867251:AAG_XQtH_fhaKhoBBFB_aeLoaA6wsLw0cn8",
+  "telegramChatId": "8544450322",
+  "stepSoftLimit": 500,
+  "autoStart": true,
+  "currentWorkspace": "AntigravityAuto",
+  "lastCascadeId": "1d134454-a0de-4279-bf64-e3f86e9ebda3",
+  "lastStepCount": 5,
+  "lastRelayedStepIndex": 3
+}

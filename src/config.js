@@ -104,10 +104,48 @@ function saveBridgeSettings(updates) {
 
 function getBridgeSettings() { return loadBridgeSettings(); }
 
+// --- Telegram-specific settings (telegram.settings.json) ---
+const TELEGRAM_SETTINGS_PATH = path.join(__dirname, '..', 'telegram.settings.json');
+const DEFAULT_TELEGRAM_SETTINGS = {
+    telegramBotToken: '',
+    telegramChatId: '',
+    stepSoftLimit: 500,
+    autoStart: false,
+    currentWorkspace: '',
+    lastCascadeId: '',
+    lastStepCount: 0,
+    lastRelayedStepIndex: -1,
+};
+
+let _telegramSettings = null;
+
+function loadTelegramSettings() {
+    if (_telegramSettings) return _telegramSettings;
+    try {
+        if (fs.existsSync(TELEGRAM_SETTINGS_PATH)) {
+            _telegramSettings = { ...DEFAULT_TELEGRAM_SETTINGS, ...JSON.parse(fs.readFileSync(TELEGRAM_SETTINGS_PATH, 'utf-8')) };
+        } else {
+            _telegramSettings = { ...DEFAULT_TELEGRAM_SETTINGS };
+        }
+    } catch {
+        _telegramSettings = { ...DEFAULT_TELEGRAM_SETTINGS };
+    }
+    return _telegramSettings;
+}
+
+function saveTelegramSettings(updates) {
+    _telegramSettings = { ...loadTelegramSettings(), ...updates };
+    fs.writeFileSync(TELEGRAM_SETTINGS_PATH, JSON.stringify(_telegramSettings, null, 2), 'utf-8');
+    return _telegramSettings;
+}
+
+function getTelegramSettings() { return loadTelegramSettings(); }
+
 module.exports = {
     lsConfig, lsInstances, platform, PORT,
     POLL_INTERVAL, FAST_POLL_INTERVAL, SLOW_POLL_INTERVAL, BATCH_SIZE,
     STEP_WINDOW_SIZE, STEP_LOAD_CHUNK,
     getSettings, saveSettings,
     getBridgeSettings, saveBridgeSettings,
+    getTelegramSettings, saveTelegramSettings,
 };

@@ -262,5 +262,18 @@ server.listen(PORT, async () => {
       console.error('  ❌ Bridge auto-start failed:', e.message);
     });
   }
+
+  // Auto-start Telegram Bridge if configured in telegram.settings.json
+  const { getTelegramSettings } = require('./src/config');
+  const tgCfg = getTelegramSettings();
+  if (tgCfg.autoStart && tgCfg.telegramBotToken && tgCfg.telegramChatId) {
+    console.log('  📱 Auto-starting Telegram Bridge...');
+    const telegramBridge = require('./src/telegram-bridge');
+    telegramBridge.startBridge(tgCfg).then(status => {
+      console.log(`  📱 Telegram Bridge ACTIVE — cascade: ${status.cascadeIdShort}`);
+    }).catch(e => {
+      console.error('  ❌ Telegram Bridge auto-start failed:', e.message);
+    });
+  }
 });
 

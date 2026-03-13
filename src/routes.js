@@ -1781,6 +1781,55 @@ function setupRoutes(app) {
             throw error;
         }
     });
+
+    // ── Telegram Bridge ──────────────────────────────────────────────────────
+
+    const telegramBridge = require('./telegram-bridge');
+
+    app.post('/api/telegram-bridge/start', async (req, res) => {
+        try {
+            const status = await telegramBridge.startBridge(req.body || {});
+            res.json({ ok: true, ...status });
+        } catch (e) {
+            res.status(400).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.post('/api/telegram-bridge/stop', (req, res) => {
+        telegramBridge.stopBridge();
+        res.json({ ok: true });
+    });
+
+    app.get('/api/telegram-bridge/status', (req, res) => {
+        res.json(telegramBridge.getStatus());
+    });
+
+    // Telegram-specific settings (telegram.settings.json)
+    const TelegramSettingsSchema = z.object({
+        telegramBotToken: z.string().max(200).optional(),
+        telegramChatId: z.string().max(100).optional(),
+        stepSoftLimit: z.number().int().min(0).max(10000).optional(),
+        autoStart: z.boolean().optional(),
+    }).strict();
+
+    app.get('/api/telegram-bridge/settings', (req, res) => {
+        const { getTelegramSettings } = require('./config');
+        res.json(getTelegramSettings());
+    });
+
+    app.post('/api/telegram-bridge/settings', (req, res) => {
+        try {
+            const validated = TelegramSettingsSchema.parse(req.body);
+            const { saveTelegramSettings } = require('./config');
+            const updated = saveTelegramSettings(validated);
+            res.json(updated);
+        } catch (error) {
+            if (error instanceof z.ZodError) {
+                return res.status(400).json({ error: 'Invalid settings', details: error.issues });
+            }
+            throw error;
+        }
+    });
 }
 
 module.exports = { setupRoutes };
