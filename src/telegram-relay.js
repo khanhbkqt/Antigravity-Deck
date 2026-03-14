@@ -1,9 +1,10 @@
 // === Telegram Relay ===
 // Low-level bot wrapper — mirrors discord-relay.js API surface.
 //
-// Two event streams:
-//   command messages  → /help, /listws, /setws
-//   regular messages  → relay to Antigravity cascade
+// Three event streams:
+//   command messages   → /help, /listws, /setws, /listconv, /joinconv
+//   callback queries   → inline keyboard button presses
+//   regular messages   → relay to Antigravity cascade
 
 const TelegramBot = require('node-telegram-bot-api');
 
@@ -12,6 +13,7 @@ let chatId = null;
 let botUsername = null;
 let onReplyCallback = null;
 let onCommandCallback = null;
+let onCallbackCallback = null;
 let onEventCallback = null;
 let isReady = false;
 
@@ -81,10 +83,21 @@ async function init(token, targetChatId, _guildId, eventHook = null) {
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('Telegram login timeout (30s)')), 30000);
 
-        bot.getMe().then(me => {
+        bot.getMe().then(async (me) => {
             clearTimeout(timeout);
             botUsername = me.username;
             isReady = true;
+
+            // Register commands with Telegram so they appear in the / menu
+            await bot.setMyCommands([
+                { command: 'help',     description: '📖 Show available commands' },
+                { command: 'listws',   description: '📂 List workspaces (inline buttons)' },
+                { command: 'setws',    description: '🔀 Switch workspace by name' },
+                { command: 'createws', description: '📁 Create new workspace' },
+                { command: 'listconv', description: '💬 List conversations (inline buttons)' },
+                { command: 'joinconv', description: '🔗 Join conversation by ID' },
+            ]).catch(e => console.warn('[Telegram] setMyCommands failed:', e.message));
+
             console.log(`[Telegram] Bot: @${botUsername}, chat: ${chatId}`);
             if (onEventCallback) onEventCallback('ready', { tag: `@${botUsername}`, channelId: chatId });
             resolve();
@@ -100,16 +113,17 @@ async function init(token, targetChatId, _guildId, eventHook = null) {
     });
 }
 
-function startListening(replyCallback, commandCallback = null) {
+function startListening(replyCallback, commandCallback = null, callbackQueryCallback = null) {
     if (!bot || !isReady) throw new Error('Telegram bot not ready');
     onReplyCallback = replyCallback;
     onCommandCallback = commandCallback;
+    onCallbackCallback = callbackQueryCallback;
 
     // ── Command messages ─────────────────────────────────────────────────
-    const COMMANDS = ['help', 'listws', 'setws', 'createws'];
+    const COMMANDS = ['help', 'listws', 'setws', 'createws', 'listconv', 'joinconv'];
 
     for (const cmd of COMMANDS) {
-        bot.onText(new RegExp(`^\\/${cmd}(?:@${botUsername})?(?:\\s+(.*))?$`, 'i'), async (msg, match) => {
+        bot.onText(new RegExp(`^\\/\\s*${cmd}(?:@${botUsername})?(?:\\s+(.*))?$`, 'i'), async (msg, match) => {
             if (String(msg.chat.id) !== chatId) return;
 
             const from = msg.from.username || msg.from.first_name || 'unknown';
@@ -125,9 +139,13 @@ function startListening(replyCallback, commandCallback = null) {
             const namedOpts = {};
             if (args[0]) namedOpts.name = args[0];
 
-            const replyFn = async (content) => {
+            const replyFn = async (content, opts = {}) => {
                 try {
-                    await sendMessage(content);
+                    if (opts.reply_markup) {
+                        await bot.sendMessage(chatId, content, { reply_markup: opts.reply_markup });
+                    } else {
+                        await sendMessage(content);
+                    }
                 } catch (e) {
                     console.warn('[Telegram] replyFn failed:', e.message);
                 }
@@ -136,6 +154,41 @@ function startListening(replyCallback, commandCallback = null) {
             await onCommandCallback(cmd, args, replyFn, namedOpts);
         });
     }
+
+    // ── Inline keyboard callback queries ─────────────────────────────────
+    bot.on('callback_query', async (query) => {
+        if (String(query.message.chat.id) !== chatId) return;
+
+        const data = query.data || '';
+        const from = query.from.username || query.from.first_name || 'unknown';
+        console.log(`[Telegram] Callback: "${data}" from @${from}`);
+        if (onEventCallback) onEventCallback('callback', { data, from });
+
+        // Acknowledge the button press immediately (removes loading spinner)
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+
+        if (onCallbackCallback) {
+            const replyFn = async (content, opts = {}) => {
+                try {
+                    if (opts.edit && query.message) {
+                        // Edit the original message instead of sending new one
+                        await bot.editMessageText(content, {
+                            chat_id: chatId,
+                            message_id: query.message.message_id,
+                            ...(opts.reply_markup ? { reply_markup: opts.reply_markup } : {}),
+                        });
+                    } else if (opts.reply_markup) {
+                        await bot.sendMessage(chatId, content, { reply_markup: opts.reply_markup });
+                    } else {
+                        await sendMessage(content);
+                    }
+                } catch (e) {
+                    console.warn('[Telegram] callback replyFn failed:', e.message);
+                }
+            };
+            await onCallbackCallback(data, replyFn, query);
+        }
+    });
 
     // ── Regular messages → relay to cascade ─────────────────────────────
     bot.on('message', async (msg) => {
@@ -166,7 +219,7 @@ function startListening(replyCallback, commandCallback = null) {
         }
     });
 
-    console.log('[Telegram] Listening (commands + messages)...');
+    console.log('[Telegram] Listening (commands + callbacks + messages)...');
     if (onEventCallback) onEventCallback('listening', { channelId: chatId });
 }
 
@@ -187,6 +240,15 @@ async function sendMessage(text) {
         const chunks = text.match(/.{1,3990}/gs) || [text];
         for (const chunk of chunks) await bot.sendMessage(chatId, chunk);
     }
+}
+
+// Send message with inline keyboard buttons
+async function sendInlineKeyboard(text, buttons, opts = {}) {
+    if (!bot || !isReady) throw new Error('Telegram bot not ready');
+    await bot.sendMessage(chatId, text, {
+        reply_markup: { inline_keyboard: buttons },
+        ...opts,
+    });
 }
 
 // Send agent response — long content (>3000 chars) attached as .md file
@@ -216,6 +278,7 @@ async function sendResponse(params) {
 async function stop() {
     onReplyCallback = null;
     onCommandCallback = null;
+    onCallbackCallback = null;
     isReady = false;
     if (bot) {
         try { await bot.stopPolling(); } catch { }
@@ -227,7 +290,7 @@ async function stop() {
 
 module.exports = {
     init, stop,
-    sendMessage, sendTyping, sendResponse,
+    sendMessage, sendTyping, sendResponse, sendInlineKeyboard,
     startListening,
     formatNotifyUser, formatCascadeSwitch, formatBridgeStatus,
     parsePiReply,
