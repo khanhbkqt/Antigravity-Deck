@@ -275,6 +275,70 @@ async function sendResponse(params) {
     }
 }
 
+// Edit an existing message (for streaming updates)
+// Rate-limited: Telegram rejects edits that are too frequent
+let _lastEditTime = 0;
+const MIN_EDIT_INTERVAL = 1200; // ms between edits
+
+async function editMessage(messageId, text) {
+    if (!bot || !isReady) throw new Error('Telegram bot not ready');
+
+    // Rate-limit protection
+    const now = Date.now();
+    if (now - _lastEditTime < MIN_EDIT_INTERVAL) {
+        return; // skip this edit — too soon
+    }
+    _lastEditTime = now;
+
+    // Telegram limit: 4096 chars
+    const truncated = text.length > 4000 ? text.substring(0, 3997) + '...' : text;
+
+    try {
+        await bot.editMessageText(truncated, {
+            chat_id: chatId,
+            message_id: messageId,
+        });
+    } catch (e) {
+        // "message is not modified" is expected when content hasn't changed
+        if (!e.message?.includes('message is not modified')) {
+            console.warn('[Telegram] editMessage failed:', e.message);
+        }
+    }
+}
+
+// Send a streaming placeholder and return its messageId
+async function sendStreamingPlaceholder() {
+    if (!bot || !isReady) throw new Error('Telegram bot not ready');
+    const msg = await bot.sendMessage(chatId, '⏳ Generating response...');
+    return msg.message_id;
+}
+
+// Finalize a streaming message — edit with final content or switch to file
+async function finalizeStreamingMessage(messageId, params) {
+    if (!bot || !isReady) throw new Error('Telegram bot not ready');
+    const { content } = params;
+
+    if (content.length > 3000) {
+        // Too long for inline — delete placeholder and send as file
+        try { await bot.deleteMessage(chatId, messageId); } catch { }
+        await sendResponse(params);
+    } else {
+        // Edit placeholder with final formatted content
+        const text = formatNotifyUser(params);
+        const truncated = text.length > 4000 ? text.substring(0, 3997) + '...' : text;
+        try {
+            await bot.editMessageText(truncated, {
+                chat_id: chatId,
+                message_id: messageId,
+            });
+        } catch (e) {
+            // Fallback: send as new message if edit fails
+            console.warn('[Telegram] finalizeStreaming edit failed, sending new:', e.message);
+            await sendResponse(params);
+        }
+    }
+}
+
 async function stop() {
     onReplyCallback = null;
     onCommandCallback = null;
@@ -291,6 +355,7 @@ async function stop() {
 module.exports = {
     init, stop,
     sendMessage, sendTyping, sendResponse, sendInlineKeyboard,
+    editMessage, sendStreamingPlaceholder, finalizeStreamingMessage,
     startListening,
     formatNotifyUser, formatCascadeSwitch, formatBridgeStatus,
     parsePiReply,

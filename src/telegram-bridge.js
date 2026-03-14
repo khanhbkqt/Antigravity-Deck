@@ -23,7 +23,7 @@ const path = require('path');
 const telegram = require('./telegram-relay');
 const { startCascade, sendMessage: cascadeSend } = require('./cascade');
 const { getStepCountAndStatus } = require('./step-cache');
-const { waitAndExtractResponse } = require('./cascade-relay');
+const { waitAndExtractResponse, streamResponse } = require('./cascade-relay');
 const { getSettings, saveSettings, getTelegramSettings, saveTelegramSettings } = require('./config');
 const { callApi: _callApi, callApiOnInstance } = require('./api');
 
@@ -706,28 +706,50 @@ async function handleUserReply({ reply, action, authorId, authorName }) {
         addLog('system', `Transitioned OK → ${shortId(activeCascadeId)}`);
     }
 
-    telegram.sendTyping();
-    const typingInterval = setInterval(() => telegram.sendTyping(), 4000); // TG typing expires after 5s
+    // Streaming: send placeholder, then progressively edit as content grows
+    let streamMsgId = null;
+    try {
+        streamMsgId = await telegram.sendStreamingPlaceholder();
+    } catch (e) {
+        addLog('error', `Failed to send streaming placeholder: ${e.message}`);
+    }
 
-    const result = await waitAndExtractResponse(cascadeIdAtSend, {
+    let lastStreamText = '';
+
+    const result = await streamResponse(cascadeIdAtSend, {
         inst: bridgeLsInst,
         fromStepIndex: lastRelayedStepIndex,
         log: addLog,
         shouldAbort: () => activeCascadeId !== cascadeIdAtSend || !isBridgeBusy,
+        onChunk: (text, isDone) => {
+            if (!streamMsgId) return;
+            if (isDone) return; // final update handled below
+            // Progressive edit — show growing content
+            if (text !== lastStreamText) {
+                lastStreamText = text;
+                const preview = text.length > 3900
+                    ? text.substring(0, 3900) + '\n\n⏳ _streaming..._'
+                    : text + '\n\n⏳ _streaming..._';
+                telegram.editMessage(streamMsgId, preview).catch(() => {});
+            }
+        },
     });
-
-    clearInterval(typingInterval);
 
     if (result.text) {
         try {
-            await telegram.sendResponse({
+            const responseParams = {
                 workspaceName,
                 cascadeIdShort: shortId(activeCascadeId),
                 stepCount: result.stepCount,
                 softLimit,
                 content: result.text,
                 mentionUserName: authorName,
-            });
+            };
+            if (streamMsgId) {
+                await telegram.finalizeStreamingMessage(streamMsgId, responseParams);
+            } else {
+                await telegram.sendResponse(responseParams);
+            }
         } catch (e) {
             isBridgeBusy = false;
             addLog('error', `Telegram send failed (response NOT consumed): ${e.message}`);

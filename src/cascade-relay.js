@@ -259,6 +259,178 @@ function findDeepText(obj, depth = 0) {
     return null;
 }
 
+// ── Streaming Response ──────────────────────────────────────────────────────
+// Like waitAndExtractResponse but calls onChunk(text, isDone) as content grows.
+// Allows UIs to progressively update (e.g., edit a Telegram message).
+
+/**
+ * Stream cascade response — calls onChunk as content grows.
+ *
+ * @param {string} cascadeId
+ * @param {object} opts
+ * @param {object} opts.inst          - LS instance
+ * @param {number} opts.fromStepIndex - scan from this index + 1
+ * @param {number} [opts.timeoutMs]   - max wait (default: 1800000)
+ * @param {function} [opts.log]       - (type, msg) logging callback
+ * @param {function} [opts.shouldAbort] - () => bool, cancel early
+ * @param {function} opts.onChunk     - (text, isDone) called as content grows
+ * @returns {Promise<{text:string|null, stepIndex:number, stepCount:number, stepType:string|null}>}
+ */
+async function streamResponse(cascadeId, opts = {}) {
+    const {
+        inst = null,
+        fromStepIndex = -1,
+        timeoutMs = 1800000,
+        log = () => { },
+        shouldAbort = () => false,
+        onChunk = () => { },
+    } = opts;
+
+    const callApiForCascade = (method, body = {}) => callApi(method, body, inst);
+    const sid = cascadeId ? cascadeId.substring(0, 8) : '--------';
+    const start = Date.now();
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 10;
+    let lastChunkText = '';  // track what we've already sent to onChunk
+    let lastChunkTime = 0;
+    const MIN_CHUNK_INTERVAL = 1200; // minimum ms between onChunk calls
+
+    while (Date.now() - start < timeoutMs) {
+        if (shouldAbort()) {
+            log('system', `[stream] Aborted for ${sid}`);
+            return noResult(0);
+        }
+
+        // Poll cascade status
+        let status = '', stepCount = 0;
+        try {
+            const info = await getStepCountAndStatus(cascadeId, callApiForCascade);
+            status = info.status || '';
+            stepCount = info.stepCount || 0;
+            consecutiveErrors = 0;
+        } catch (e) {
+            consecutiveErrors++;
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                log('error', `[stream] Too many errors for ${sid} — aborting`);
+                return noResult(0);
+            }
+            await sleep(getPollInterval(Date.now() - start));
+            continue;
+        }
+
+        // Error status — try final scan
+        if (ERROR_STATUSES.has(status)) {
+            const result = await fetchAndScan(cascadeId, fromStepIndex, inst, log);
+            if (result.text) {
+                onChunk(result.text, true);
+                return result;
+            }
+            return noResult(stepCount);
+        }
+
+        // Try to extract growing content from the latest step
+        const isRunning = status === 'CASCADE_RUN_STATUS_RUNNING' ||
+            status === 'CASCADE_RUN_STATUS_WAITING_FOR_USER';
+        const isDone = DONE_STATUSES.has(status) && stepCount > 0;
+
+        if (stepCount > 0) {
+            // Fetch tail steps to find streaming content
+            const partialText = await fetchStreamingContent(cascadeId, fromStepIndex, inst, log);
+
+            if (partialText && partialText !== lastChunkText) {
+                const now = Date.now();
+                // Rate-limit chunks (except for final)
+                if (!isDone && (now - lastChunkTime) < MIN_CHUNK_INTERVAL) {
+                    // Skip this chunk — too soon
+                } else {
+                    lastChunkText = partialText;
+                    lastChunkTime = now;
+
+                    if (isDone) {
+                        // Final chunk
+                        onChunk(partialText, true);
+                        log('system', `[stream] ✓ Final chunk for ${sid}: "${partialText.substring(0, 60)}..."`);
+                        // Build proper result
+                        const result = await fetchAndScan(cascadeId, fromStepIndex, inst, log);
+                        return result.text ? result : { text: partialText, stepIndex: stepCount - 1, stepCount, stepType: 'streamed' };
+                    } else {
+                        onChunk(partialText, false);
+                    }
+                }
+            }
+        }
+
+        // Done but no streaming content found — fall back to full scan
+        if (isDone) {
+            log('system', `[stream] ${sid} is done — full scan fallback`);
+            const result = await fetchAndScan(cascadeId, fromStepIndex, inst, log);
+            if (result.text) {
+                onChunk(result.text, true);
+                return result;
+            }
+            // Intermediate IDLE — keep polling
+            log('system', `[stream] No content yet in ${sid} — intermediate IDLE`);
+        }
+
+        await sleep(getPollInterval(Date.now() - start));
+    }
+
+    log('system', `[stream] Timeout for ${sid}`);
+    return noResult(0);
+}
+
+// Fetch the latest growing content from the newest response step
+async function fetchStreamingContent(cascadeId, fromStepIndex, inst, log) {
+    const callApiForCascade = (method, body = {}) => callApi(method, body, inst);
+
+    let stepCount = 0;
+    try {
+        const info = await getStepCountAndStatus(cascadeId, callApiForCascade);
+        stepCount = info.stepCount || 0;
+    } catch { return null; }
+
+    if (stepCount <= 0) return null;
+
+    // Fetch the last few steps
+    const TAIL = 5;
+    const fetchFrom = Math.max(0, stepCount - TAIL);
+    let steps = [];
+    try {
+        const data = await callApiForCascade('GetCascadeTrajectorySteps', {
+            cascadeId,
+            startIndex: fetchFrom,
+            endIndex: stepCount,
+        });
+        steps = data?.steps || [];
+    } catch { return null; }
+
+    // Scan backwards from newest step for response content
+    for (let i = steps.length - 1; i >= 0; i--) {
+        const s = steps[i];
+        if (!s) continue;
+
+        const serverIdx = fetchFrom + i;
+        if (serverIdx <= fromStepIndex) break; // don't go past what was already relayed
+
+        // NOTIFY_USER — always the final response
+        if (s.type === 'CORTEX_STEP_TYPE_NOTIFY_USER' && s.notifyUser) {
+            const text = extractContent(s);
+            if (text) return text;
+        }
+
+        // PLANNER_RESPONSE — the field that streams (grows as tokens arrive)
+        if (s.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE' && s.plannerResponse) {
+            // Skip if has toolCalls (thinking/planning step)
+            if (s.plannerResponse.toolCalls && s.plannerResponse.toolCalls.length > 0) continue;
+
+            const text = extractContent(s);
+            if (text) return text;
+        }
+    }
+
+    return null;
+}
+
 // ── Utils ────────────────────────────────────────────────────────────────────
 
 function noResult(stepCount) {
@@ -269,4 +441,4 @@ function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
-module.exports = { waitAndExtractResponse, extractContent };
+module.exports = { waitAndExtractResponse, streamResponse, extractContent };
