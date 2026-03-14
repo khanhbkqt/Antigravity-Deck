@@ -191,39 +191,102 @@ function buildWorkspaceButtons(lsInstances, wsRoot) {
     return rows;
 }
 
-async function buildConversationButtons(inst) {
+async function buildConversationButtons() {
+    const { lsInstances } = require('./config');
     const rows = [];
-    try {
-        const data = inst
-            ? await callApiOnInstance(inst, 'GetAllCascadeTrajectories')
-            : null;
 
-        if (data?.trajectorySummaries) {
-            const entries = Object.entries(data.trajectorySummaries)
-                .sort((a, b) => {
-                    const tA = a[1].lastUpdatedTime || '0';
-                    const tB = b[1].lastUpdatedTime || '0';
-                    return tB.localeCompare(tA);
-                })
-                .slice(0, 15); // cap at 15
+    // Query ALL instances and merge — also track which instance owns each cascade
+    const merged = {};
+    const cascadeInst = {}; // cascadeId → instance
+    const instList = bridgeLsInst ? [bridgeLsInst] : [];
+    for (const inst of lsInstances) {
+        const ii = { port: inst.port, csrfToken: inst.csrfToken, useTls: inst.useTls };
+        if (!instList.some(x => x.port === ii.port)) instList.push(ii);
+    }
 
-            for (const [id, summary] of entries) {
-                const short = id.substring(0, 8);
-                const status = summary.runStatus || '';
-                const steps = summary.stepCount || 0;
-                const isActive = id === activeCascadeId;
-
-                let icon = '⚪';
-                if (isActive) icon = '🟢';
-                else if (status.includes('RUNNING')) icon = '🔵';
-                else if (status.includes('DONE') || status.includes('COMPLETED')) icon = '⚫';
-
-                const label = `${icon} #${short} • ${steps} steps${isActive ? ' ← joined' : ''}`;
-                rows.push([{ text: label, callback_data: `conv:${id}` }]);
+    for (const ii of instList) {
+        try {
+            const data = await callApiOnInstance(ii, 'GetAllCascadeTrajectories');
+            if (data?.trajectorySummaries) {
+                for (const [id, info] of Object.entries(data.trajectorySummaries)) {
+                    merged[id] = info;
+                    cascadeInst[id] = ii;
+                }
             }
+        } catch (e) {
+            addLog('error', `Failed to query instance port ${ii.port}: ${e.message}`);
         }
-    } catch (e) {
-        addLog('error', `Failed to list conversations: ${e.message}`);
+    }
+
+    const entries = Object.entries(merged)
+        .sort((a, b) => {
+            const tA = a[1].lastUpdatedTime || '0';
+            const tB = b[1].lastUpdatedTime || '0';
+            return tB.localeCompare(tA);
+        })
+        .slice(0, 15); // cap at 15
+
+    // Fetch first user message for each conversation (in parallel, with timeout)
+    const previews = {};
+    await Promise.all(entries.map(async ([id]) => {
+        try {
+            const inst = cascadeInst[id];
+            if (!inst) return;
+            const data = await callApiOnInstance(inst, 'GetCascadeTrajectorySteps', {
+                cascadeId: id, startIndex: 0, endIndex: 3,
+            });
+            const steps = data?.steps || [];
+            // Find first USER_TURN step with content
+            for (const s of steps) {
+                const type = s.type || '';
+                if (type.includes('USER') || type.includes('user') || type === 'CORTEX_STEP_TYPE_USER_INPUT') {
+                    const content = s.content?.rawContent || s.content?.content || '';
+                    if (content.trim()) {
+                        previews[id] = content.trim();
+                        return;
+                    }
+                }
+            }
+            // Fallback: any step with text content
+            for (const s of steps) {
+                const content = s.content?.rawContent || s.content?.content || '';
+                if (content.trim()) {
+                    previews[id] = content.trim();
+                    return;
+                }
+            }
+        } catch { /* ignore — show ID fallback */ }
+    }));
+
+    // Build button rows
+    for (const [id, summary] of entries) {
+        const status = summary.runStatus || '';
+        const steps = summary.stepCount || 0;
+        const isActive = id === activeCascadeId;
+
+        let icon = '⚪';
+        if (isActive) icon = '🟢';
+        else if (status.includes('RUNNING')) icon = '🔵';
+        else if (status.includes('DONE') || status.includes('COMPLETED')) icon = '⚫';
+
+        // Build preview text: first user message → truncated to fit
+        const raw = previews[id] || '';
+        // Clean up: collapse whitespace, remove markdown
+        const clean = raw.replace(/[#*_`~>\[\]()]/g, '').replace(/\s+/g, ' ').trim();
+
+        // Telegram button limit is 64 chars. Icon + steps take ~15, so preview gets ~45
+        const maxPreview = 42;
+        const preview = clean
+            ? (clean.length > maxPreview ? clean.substring(0, maxPreview - 1) + '…' : clean)
+            : `#${id.substring(0, 8)}`;
+
+        const joined = isActive ? ' ✓' : '';
+        const label = `${icon} ${preview} (${steps})${joined}`;
+        rows.push([{ text: label, callback_data: `conv:${id}` }]);
+    }
+
+    if (entries.length === 0) {
+        rows.push([{ text: '📭 No conversations found', callback_data: 'noop' }]);
     }
 
     // New conversation + refresh buttons
@@ -280,7 +343,7 @@ async function handleCommand(cmd, args, replyFn) {
         }
 
         case 'listconv': {
-            const buttons = await buildConversationButtons(bridgeLsInst);
+            const buttons = await buildConversationButtons();
             const header = `💬 *Conversations* in \`${workspaceName}\`\n\nCurrent: #${shortId(activeCascadeId)} (${stepCount} steps)\nTap to join:`;
             await replyFn(header, {
                 reply_markup: { inline_keyboard: buttons },
@@ -333,9 +396,11 @@ async function handleCallbackQuery(data, replyFn, query) {
         const header = `📂 *Workspaces*\n\nCurrent: \`${workspaceName}\`\nTap to switch:`;
         await replyFn(header, { edit: true, reply_markup: { inline_keyboard: buttons } });
     } else if (data === 'refresh_conv') {
-        const buttons = await buildConversationButtons(bridgeLsInst);
+        const buttons = await buildConversationButtons();
         const header = `💬 *Conversations* in \`${workspaceName}\`\n\nCurrent: #${shortId(activeCascadeId)} (${stepCount} steps)\nTap to join:`;
         await replyFn(header, { edit: true, reply_markup: { inline_keyboard: buttons } });
+    } else if (data === 'noop') {
+        // Do nothing — placeholder button
     } else {
         await replyFn(`❓ Unknown action: ${data}`);
     }

@@ -3,8 +3,8 @@
   "telegramChatId": "8544450322",
   "stepSoftLimit": 500,
   "autoStart": true,
-  "currentWorkspace": "AntigravityAuto",
-  "lastCascadeId": "1d134454-a0de-4279-bf64-e3f86e9ebda3",
-  "lastStepCount": 5,
-  "lastRelayedStepIndex": 3
+  "currentWorkspace": "vibe-frame",
+  "lastCascadeId": "524b8d53-d98e-41e4-8a9f-ea2d2e824998",
+  "lastStepCount": 0,
+  "lastRelayedStepIndex": -1
 }
